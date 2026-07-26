@@ -34,9 +34,18 @@ class GPTConfig:
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
-    # Characters: L=long (full context), S=short (quarter context)
+    # Characters: L=long (full context), S=short (quarter context), M=MSA (sparse, see below)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # MSA (MiniMax Sparse Attention, arXiv:2606.13392), used by layers marked 'M' above.
+    # An MSA layer keeps a fixed attention budget of msa_top_k * msa_block_size tokens per
+    # query, selected dynamically per GQA group by a lightweight index branch.
+    msa_block_size: int = 64 # B_k: key block size for index selection
+    msa_top_k: int = 8 # k: number of blocks selected per query per GQA group
+    msa_idx_dim: int = 64 # d_idx: index head dimension
+    msa_kl_weight: float = 1e-3 # lambda weight on the sum of per-layer index KL losses
+    msa_warmup_frac: float = 0.01 # fraction of training steps with dense attention (indexer warmup)
+    msa_idx_rope: bool = False # apply rotary embeddings to index q/k (ablation flag)
 
 
 def norm(x):
@@ -81,7 +90,8 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, msa_dense=False, need_kl=False):
+        # msa_dense/need_kl are accepted for API compatibility with MSAAttention and ignored here
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -125,7 +135,168 @@ class CausalSelfAttention(nn.Module):
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
-        return y
+        return y, None, None
+
+
+class MSAAttention(nn.Module):
+    """
+    MiniMax Sparse Attention (arXiv:2606.13392). Two branches:
+
+    - Index Branch: one index query head per GQA group + a single shared index key head
+      (both computed from detached input). Scores the full causal context, max-pools
+      scores to blocks of size B_k, and selects the top-k blocks per query per GQA group.
+      The local block containing the query is always selected.
+    - Main Branch: ordinary GQA softmax attention restricted to the selected blocks,
+      with the selection shared by all query heads in a group.
+
+    The index branch is trained with a KL loss aligning its distribution (over the
+    selected tokens) to the detached, group-averaged Main Branch distribution.
+    During indexer warmup (msa_dense=True) the Main Branch runs full attention and the
+    KL is computed over the whole causal context; afterwards it runs block-sparse and
+    the KL is restricted to the selected tokens.
+
+    Reference implementation: plain PyTorch (torch.topk + masked SDPA). Correctness over
+    speed; efficient inference and FlexAttention paths are future work (plan steps 5-6).
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.group_size = self.n_head // self.n_kv_head # G: query heads per GQA group
+        self.block_size = config.msa_block_size
+        self.top_k = config.msa_top_k
+        self.idx_dim = config.msa_idx_dim
+        self.idx_rope = config.msa_idx_rope
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        assert self.idx_dim % 2 == 0
+        # Main branch projections (identical to CausalSelfAttention)
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Index branch projections: one index query head per GQA group, one shared index key head
+        self.c_q_idx = Linear(self.n_embd, self.n_kv_head * self.idx_dim, bias=False)
+        self.c_k_idx = Linear(self.n_embd, self.idx_dim, bias=False)
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, msa_dense=False, need_kl=False):
+        B, T, C = x.size()
+
+        # Main branch QKV projections (same recipe as CausalSelfAttention)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            v = v + gate.unsqueeze(-1) * ve
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k) # QK norm
+        q = q * 1.2
+        k = k * 1.2
+
+        if kv_cache is not None:
+            # Inference fallback: dense attention over the full KV cache (correct, just not sparse).
+            # TODO (plan step 5): true sparse decode with block selection + index-K cache.
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=window_size,
+            )
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+            y = y.contiguous().view(B, T, -1)
+            return self.c_proj(y), None, None
+
+        # Index branch: detached input, so the KL loss trains only c_q_idx/c_k_idx
+        x_det = x.detach()
+        q_idx = self.c_q_idx(x_det).view(B, T, self.n_kv_head, self.idx_dim)
+        k_idx = self.c_k_idx(x_det).view(B, T, self.idx_dim)
+        if self.idx_rope:
+            d = self.idx_dim // 2
+            cos_idx, sin_idx = cos[..., :d], sin[..., :d]
+            q_idx = apply_rotary_emb(q_idx, cos_idx, sin_idx)
+            k_idx = apply_rotary_emb(k_idx.unsqueeze(2), cos_idx, sin_idx).squeeze(2)
+        q_idx, k_idx = norm(q_idx), norm(k_idx)
+
+        # Token-level index scores, causally masked: (B, H_kv, T_q, T_k)
+        causal_bool = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        idx_scores = torch.einsum('bthd,bsd->bhts', q_idx, k_idx) * (self.idx_dim ** -0.5)
+        idx_scores = idx_scores.masked_fill(~causal_bool, float('-inf'))
+
+        if msa_dense:
+            # Indexer warmup: full attention, KL over the whole causal context
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = y.contiguous().view(B, T, -1)
+            sel_mask = causal_bool # (T, T), broadcast in the KL below
+        else:
+            # Block max-pool the index scores: (B, H_kv, T, n_blocks)
+            Bk = self.block_size
+            n_blocks = (T + Bk - 1) // Bk
+            pad = n_blocks * Bk - T
+            scores_padded = F.pad(idx_scores, (0, pad), value=float('-inf'))
+            block_scores = scores_padded.view(B, self.n_kv_head, T, n_blocks, Bk).amax(dim=-1)
+            # The local block containing the query is always selected (force its score to +inf)
+            local_block = torch.arange(T, device=x.device) // Bk # (T,)
+            block_scores.scatter_(-1, local_block.view(1, 1, T, 1).expand(B, self.n_kv_head, T, 1), float('inf'))
+            # Top-k block selection per query per GQA group (exp-free: rank raw scores)
+            k_sel = min(self.top_k, n_blocks)
+            topk_idx = block_scores.topk(k_sel, dim=-1).indices # (B, H_kv, T, k_sel)
+            sel_blocks = torch.zeros(B, self.n_kv_head, T, n_blocks, dtype=torch.bool, device=x.device)
+            sel_blocks.scatter_(-1, topk_idx, True)
+            # Expand block selection to token granularity and re-apply causality
+            token_block = torch.arange(T, device=x.device) // Bk # (T_k,)
+            sel_mask = sel_blocks[:, :, :, token_block] & causal_bool # (B, H_kv, T, T)
+            # Main branch: SDPA over selected tokens only. Query heads are merged into the
+            # GQA group dimension so the per-group mask broadcasts over the G heads in it.
+            G = self.group_size
+            q_g = q.view(B, T, self.n_kv_head, G, self.head_dim).permute(0, 2, 3, 1, 4).reshape(B * self.n_kv_head, G, T, self.head_dim)
+            k_g = k.permute(0, 2, 1, 3).unsqueeze(2).expand(B, self.n_kv_head, G, T, self.head_dim).reshape(B * self.n_kv_head, G, T, self.head_dim)
+            v_g = v.permute(0, 2, 1, 3).unsqueeze(2).expand(B, self.n_kv_head, G, T, self.head_dim).reshape(B * self.n_kv_head, G, T, self.head_dim)
+            mask_g = sel_mask.unsqueeze(2).reshape(B * self.n_kv_head, 1, T, T)
+            y = F.scaled_dot_product_attention(q_g, k_g, v_g, attn_mask=mask_g) # default scale 1/sqrt(head_dim)
+            y = y.view(B, self.n_kv_head, G, T, self.head_dim).permute(0, 3, 1, 2, 4).reshape(B, T, self.n_head * self.head_dim)
+
+        # Auxiliary KL loss: align the index distribution with the detached, group-averaged
+        # Main Branch distribution over the selected token set (all causal tokens in warmup)
+        kl = None
+        recall = None
+        if need_kl:
+            G = self.group_size
+            with torch.no_grad():
+                # Main branch logits over the full causal context: (B, H_kv, G, T, T)
+                main_logits = torch.einsum('bthgd,bshd->bhgts', q.view(B, T, self.n_kv_head, G, self.head_dim), k) * (self.head_dim ** -0.5)
+                main_logits = main_logits.masked_fill(~causal_bool, float('-inf'))
+                if not msa_dense:
+                    # Block recall diagnostic (from the paper): overlap between the index
+                    # branch's top-k blocks and the top-k blocks induced by the main branch
+                    main_blk = main_logits.mean(dim=2) # group-averaged scores: (B, H_kv, T, T)
+                    main_blk = F.pad(main_blk, (0, pad), value=float('-inf')).view(B, self.n_kv_head, T, n_blocks, Bk).amax(dim=-1)
+                    main_blk.scatter_(-1, local_block.view(1, 1, T, 1).expand(B, self.n_kv_head, T, 1), float('inf'))
+                    main_topk = main_blk.topk(k_sel, dim=-1).indices # (B, H_kv, T, k_sel)
+                    inter = (main_topk.unsqueeze(-1) == topk_idx.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+                    recall = (inter.float() / k_sel).mean()
+                # Restrict to the selected token set for the teacher distribution
+                teacher_mask = sel_mask.unsqueeze(2) if sel_mask.dim() == 4 else sel_mask
+                main_logits = main_logits.masked_fill(~teacher_mask, float('-inf'))
+                teacher_p = F.log_softmax(main_logits.float(), dim=-1).exp().mean(dim=2) # average over G heads
+            student_logp = F.log_softmax(idx_scores.masked_fill(~sel_mask, float('-inf')).float(), dim=-1)
+            # Zero out log-probs outside the selected set: teacher_p is 0 there, and
+            # kl_div's target*input term would otherwise produce 0*(-inf) = NaN
+            student_logp = student_logp.masked_fill(~sel_mask, 0.0)
+            kl = F.kl_div(student_logp, teacher_p, reduction='none').sum(dim=-1).mean()
+
+        y = self.c_proj(y)
+        return y, kl, recall
 
 
 class MLP(nn.Module):
@@ -142,15 +313,16 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_msa=False):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = MSAAttention(config, layer_idx) if use_msa else CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, msa_dense=False, need_kl=False):
+        attn_out, kl, recall = self.attn(norm(x), ve, cos_sin, window_size, kv_cache, msa_dense=msa_dense, need_kl=need_kl)
+        x = x + attn_out
         x = x + self.mlp(norm(x))
-        return x
+        return x, kl, recall
 
 
 class GPT(nn.Module):
@@ -164,7 +336,8 @@ class GPT(nn.Module):
         self.config = config
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
-        self.window_sizes = self._compute_window_sizes(config)
+        self.window_sizes, self.msa_layers = self._compute_window_sizes(config)
+        self.has_msa = any(self.msa_layers)
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -172,7 +345,7 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, use_msa=self.msa_layers[layer_idx]) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -228,6 +401,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if isinstance(block.attn, MSAAttention):
+                torch.nn.init.uniform_(block.attn.c_q_idx.weight, -s, s) # index branch: init like c_q/c_k
+                torch.nn.init.uniform_(block.attn.c_k_idx.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -288,30 +464,40 @@ class GPT(nn.Module):
         """
         Compute per-layer window sizes for sliding window attention.
 
-        Returns list of (left, right) tuples for FA3's window_size parameter:
-        - left: how many tokens before current position to attend to (-1 = unlimited)
-        - right: how many tokens after current position to attend to (0 for causal)
+        Returns (window_sizes, msa_layers):
+        - window_sizes: list of (left, right) tuples for FA3's window_size parameter:
+          left = how many tokens before current position to attend to (-1 = unlimited),
+          right = how many tokens after current position to attend to (0 for causal)
+        - msa_layers: list of bools, True for layers using MSA sparse attention
 
         Pattern string is tiled across layers. Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
+        Characters: L=long (full context), S=short (quarter context), M=MSA (sparse;
+        gets a full-context window since it does its own block selection internally)
         """
         pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
+        assert all(c in "SLM" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S, L and M."
+        if "M" in pattern:
+            assert config.msa_block_size * config.msa_top_k <= config.sequence_len, (
+                f"MSA budget msa_top_k*msa_block_size ({config.msa_top_k * config.msa_block_size}) "
+                f"exceeds sequence_len ({config.sequence_len}): sparsity would be a no-op")
         # Map characters to window sizes
         long_window = config.sequence_len
         short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
+            "M": (long_window, 0),
         }
         # Tile pattern across layers
         window_sizes = []
+        msa_layers = []
         for layer_idx in range(config.n_layer):
             char = pattern[layer_idx % len(pattern)]
+            if layer_idx == config.n_layer - 1:
+                char = "L" # final layer always gets full-context dense attention
             window_sizes.append(char_to_window[char])
-        # Final layer always gets full context
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
+            msa_layers.append(char == "M")
+        return window_sizes, msa_layers
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -329,14 +515,41 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
+        # Sum attention FLOPs per layer, accounting for sliding window / MSA sparsity
         attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+        for window_size, is_msa in zip(self.window_sizes, self.msa_layers):
+            if is_msa:
+                attn_flops += self._msa_attn_flops_per_token()
+            else:
+                window = window_size[0]  # (left, right) tuple, we use left
+                effective_seq = t if window < 0 else min(window, t)
+                attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
         return num_flops_per_token
+
+    def _msa_budget(self, t=None):
+        """Number of tokens each query attends to in an MSA layer (the fixed selection budget)."""
+        t = t or self.config.sequence_len
+        return min(self.config.msa_top_k * self.config.msa_block_size, t)
+
+    def _msa_attn_flops_per_token(self):
+        """
+        Algorithmic FLOPs per token (fwd+bwd) for one MSA layer, following the paper's
+        complexity model (arXiv:2606.13392): index branch scores over the full causal
+        context (QK^T only, 2*H_kv*d_idx*t forward) + main branch over the k*B_k selected
+        tokens (4*H_q*d_h*budget forward), times 3 for fwd+bwd, plus the forward-only
+        teacher logits pass (2*H_q*d_h*t) used by the KL loss during training.
+        Note: during indexer warmup MSA layers are dense (12*h*q*t), and the current
+        masked-SDPA reference path executes dense attention; this reports the algorithmic
+        cost that the sparse implementation (FlexAttention, plan step 6) realizes.
+        """
+        c = self.config
+        h, q, t = c.n_head, c.n_embd // c.n_head, c.sequence_len
+        budget = self._msa_budget(t)
+        idx_flops = 2 * c.n_kv_head * c.msa_idx_dim * t
+        main_flops = 4 * h * q * budget
+        teacher_flops = 2 * h * q * t # KL teacher logits, forward only (no_grad)
+        return 3 * (idx_flops + main_flops) + teacher_flops
 
     def num_matmul_params(self):
         """
@@ -355,7 +568,14 @@ class GPT(nn.Module):
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
+        attn_flops = 0
+        for (window, _), is_msa in zip(self.window_sizes, self.msa_layers):
+            if is_msa:
+                # sparse decode (plan step 5): index pass over full context + selected blocks
+                attn_flops += 4 * h * q * min(context_len, self._msa_budget()) \
+                              + 2 * self.config.n_kv_head * self.config.msa_idx_dim * context_len
+            else:
+                attn_flops += 4 * h * q * min(context_len, window)
         decode_flops = 2 * self.num_matmul_params() + attn_flops
         return decode_flops
 
@@ -364,10 +584,18 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = 0
-        for window, _ in self.window_sizes:
-            w = min(window, num_tokens)
-            attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
-            attn_flops += 4 * h * q * attended_tokens
+        for (window, _), is_msa in zip(self.window_sizes, self.msa_layers):
+            if is_msa:
+                # index branch scores: causal, so 2*H_kv*d_idx per (query, key) pair
+                attn_flops += 2 * self.config.n_kv_head * self.config.msa_idx_dim * num_tokens * (num_tokens + 1) // 2
+                # main branch: attends to min(budget, t) tokens at position t
+                w = min(self._msa_budget(), num_tokens)
+                attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w
+                attn_flops += 4 * h * q * attended_tokens
+            else:
+                w = min(window, num_tokens)
+                attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
+                attn_flops += 4 * h * q * attended_tokens
         prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
         return prefill_flops
 
@@ -383,8 +611,13 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
-        for window, _ in self.window_sizes:
-            total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
+        for (window, _), is_msa in zip(self.window_sizes, self.msa_layers):
+            if is_msa:
+                # sparse decode (plan step 5): read selected blocks + the index-K cache
+                total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, self._msa_budget())
+                total += self.config.msa_idx_dim * kv_dtype_bytes * context_len # single shared index key head
+            else:
+                total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
         return total
 
     def num_scaling_params(self):
@@ -456,7 +689,9 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', msa_dense=False, return_kl=False):
+        # msa_dense: run MSA layers with full attention (indexer warmup phase of training)
+        # return_kl: also compute and return the sum of per-layer MSA index KL losses
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -496,10 +731,18 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        kl_total = None # sum of per-layer MSA index KL losses (if any MSA layers)
+        recall_total = None # mean of per-layer MSA block recall diagnostics
+        n_recall = 0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x, kl, recall = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, msa_dense=msa_dense, need_kl=return_kl)
+            if kl is not None:
+                kl_total = kl if kl_total is None else kl_total + kl
+            if recall is not None:
+                recall_total = recall if recall_total is None else recall_total + recall
+                n_recall += 1
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -518,6 +761,14 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_kl:
+                if kl_total is None:
+                    kl_total = logits.new_zeros(())
+                if recall_total is None:
+                    recall_total = logits.new_zeros(())
+                else:
+                    recall_total = recall_total / n_recall
+                return loss, kl_total, recall_total
             return loss
         else:
             # inference: just return the logits directly

@@ -52,7 +52,13 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default="SSSL", help="attention pattern tiled across layers: L=full, S=short window, M=MSA sparse (e.g. 'SSL', 'SSSM', 'M')")
+# MSA (MiniMax Sparse Attention) - only used by layers marked 'M' in --window-pattern
+parser.add_argument("--msa-block-size", type=int, default=64, help="MSA key block size B_k")
+parser.add_argument("--msa-top-k", type=int, default=8, help="MSA number of blocks selected per query per GQA group")
+parser.add_argument("--msa-idx-dim", type=int, default=64, help="MSA index head dimension d_idx")
+parser.add_argument("--msa-kl-weight", type=float, default=1e-3, help="weight lambda on the summed per-layer index KL losses")
+parser.add_argument("--msa-warmup-frac", type=float, default=0.01, help="fraction of training steps with dense attention (indexer warmup)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -138,6 +144,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        msa_block_size=args.msa_block_size, msa_top_k=args.msa_top_k, msa_idx_dim=args.msa_idx_dim,
+        msa_kl_weight=args.msa_kl_weight, msa_warmup_frac=args.msa_warmup_frac,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -353,6 +361,17 @@ elif args.target_param_data_ratio > 0:
 else:
     raise ValueError("No training horizon specified")
 total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
+
+# MSA indexer warmup: the first msa_warmup_frac of steps run MSA layers with dense attention
+# while the index branch is trained with the KL loss, then we switch to sparse attention
+has_msa = any(orig_model.msa_layers)
+if has_msa:
+    msa_warmup_steps = round(args.msa_warmup_frac * num_iterations)
+    budget = args.msa_top_k * args.msa_block_size
+    n_blocks = -(-args.max_seq_len // args.msa_block_size) # ceil division
+    chance_recall = min(args.msa_top_k, n_blocks) / n_blocks
+    print0(f"MSA enabled ({sum(orig_model.msa_layers)}/{args.depth} layers): budget k*B_k = {args.msa_top_k}*{args.msa_block_size} = {budget} tokens, "
+           f"indexer warmup for {msa_warmup_steps:,} steps, KL weight {args.msa_kl_weight}, chance block recall {chance_recall:.3f}")
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
@@ -395,6 +414,8 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    smooth_train_kl = 0 # EMA of MSA index KL loss
+    smooth_train_recall = 0 # EMA of MSA block recall (sparse phase only)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -402,6 +423,8 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_train_kl = loop_state.get("smooth_train_kl", 0)
+    smooth_train_recall = loop_state.get("smooth_train_recall", 0)
     total_training_time = loop_state["total_training_time"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
@@ -493,6 +516,8 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "smooth_train_kl": smooth_train_kl,
+                    "smooth_train_recall": smooth_train_recall,
                     "total_training_time": total_training_time,
                 },
             },
@@ -508,9 +533,21 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    if has_msa and step == msa_warmup_steps:
+        print0(f"Step {step}: MSA indexer warmup complete, switching to sparse attention")
+    msa_kl_accum = torch.zeros((), device=device) # sum of detached per-microbatch KLs, for logging
+    msa_recall_accum = torch.zeros((), device=device) # same for the block recall diagnostic
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        if has_msa:
+            lm_loss, msa_kl, msa_recall = model(x, y, msa_dense=step < msa_warmup_steps, return_kl=True)
+            loss = lm_loss + args.msa_kl_weight * msa_kl # total loss = LM loss + lambda * sum of per-layer KLs
+            train_loss = lm_loss.detach() # for logging
+            msa_kl_accum += msa_kl.detach()
+            if step >= msa_warmup_steps: # recall is only computed in the sparse phase
+                msa_recall_accum += msa_recall
+        else:
+            loss = model(x, y)
+            train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -549,6 +586,16 @@ while True:
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    kl_str = ""
+    if has_msa:
+        train_kl_f = (msa_kl_accum / grad_accum_steps).item()
+        smooth_train_kl = ema_beta * smooth_train_kl + (1 - ema_beta) * train_kl_f
+        debiased_smooth_kl = smooth_train_kl / (1 - ema_beta**(step + 1))
+        kl_str = f" | kl: {debiased_smooth_kl:.4f}"
+        if step >= msa_warmup_steps:
+            train_recall_f = (msa_recall_accum / grad_accum_steps).item()
+            smooth_train_recall = ema_beta * smooth_train_recall + (1 - ema_beta) * train_recall_f
+            kl_str += f" | recall: {smooth_train_recall:.3f}"
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -565,13 +612,15 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{kl_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if last_step or step % args.log_interval == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/msa_kl": debiased_smooth_kl if has_msa else 0.0,
+            "train/msa_recall": smooth_train_recall if has_msa else 0.0,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
