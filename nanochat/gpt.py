@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Progressive Residual Warmup (ProRes): warmup period T for first layer (0 = disabled).
+    # Layer l warms up over T*l steps, deeper layers engage later. See arxiv 2603.05369.
+    prores_T: int = 0
 
 
 def norm(x):
@@ -148,9 +151,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        attn_residual = self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        mlp_residual = self.mlp(norm(x + attn_residual))
+        return attn_residual, mlp_residual
 
 
 class GPT(nn.Module):
@@ -456,7 +459,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', alpha=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -499,7 +502,12 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            attn_residual, mlp_residual = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            residual = attn_residual + mlp_residual
+            if alpha is not None:
+                # ProRes: scale residual branch by schedule (shallow layers warm up first)
+                residual = residual * alpha[i]
+            x = x + residual
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

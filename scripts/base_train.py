@@ -53,6 +53,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--prores-T", type=int, default=0, help="Progressive Residual Warmup period T for first layer (0 = disabled). Layer l warms up over T*l steps.")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,7 +138,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, prores_T=args.prores_T,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -387,6 +388,23 @@ def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
+# ProRes (Progressive Residual Warmup) alpha schedule
+# Pre-compute per-layer scaling factors as a tensor to avoid torch.compile recompilation.
+# Pass alpha=None to model when ProRes is disabled (model treats it as no-op).
+prores_alpha = None
+if args.prores_T > 0:
+    prores_T = args.prores_T
+    n_layer = args.depth
+    print0(f"ProRes enabled: T={prores_T}, layer {n_layer} finishes warmup at step {prores_T * n_layer}")
+
+    def get_prores_alpha(step):
+        """Compute per-layer ProRes scaling factors: alpha(l) = min(step / (T * (l+1)), 1)."""
+        return torch.tensor(
+            [min(step / (prores_T * (i + 1)), 1.0) for i in range(n_layer)],
+            dtype=COMPUTE_DTYPE, device=device,
+        )
+
+# -----------------------------------------------------------------------------
 # Training loop
 
 # Loop state (variables updated by the training loop)
@@ -505,11 +523,14 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # Update ProRes alpha for this step (before forward pass)
+    if args.prores_T > 0:
+        prores_alpha = get_prores_alpha(step)
     # evaluate the gradient
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, alpha=prores_alpha)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
