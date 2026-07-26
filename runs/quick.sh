@@ -81,8 +81,11 @@ torchrun --standalone --nnodes 1 --nproc_per_node=1 -m scripts.base_train -- \
   --aspect-ratio=64 \
   --head-dim=64 \
   --window-pattern=SSSL \
+  --nsa-block-size 64 \
+  --nsa-top-k-blocks 2 \
+  --nsa-window-size 256 \
   --max-seq-len=1024 \
-  --device-batch-size=8 \
+  --device-batch-size=2 \
   --eval-every=-1 \
   --core-metric-every=-1 \
   --sample-every=-1 \

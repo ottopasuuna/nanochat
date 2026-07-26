@@ -53,6 +53,12 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# NSA (Native Sparse Attention) configuration
+parser.add_argument("--nsa-block-size", type=int, default=0, help="NSA compression block size (0 = disable NSA, use standard attention)")
+parser.add_argument("--nsa-stride", type=int, default=0, help="NSA stride between compression blocks (0 = defaults to block size)")
+parser.add_argument("--nsa-top-k-blocks", type=int, default=4, help="NSA number of blocks to select for fine-grained attention")
+parser.add_argument("--nsa-window-size", type=int, default=256, help="NSA sliding window size for local branch")
+parser.add_argument("--nsa-cmp-mlp-ratio", type=int, default=4, help="NSA compression MLP hidden dim ratio")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -138,6 +144,11 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        nsa_block_size=args.nsa_block_size,
+        nsa_stride=args.nsa_stride,
+        nsa_top_k_blocks=args.nsa_top_k_blocks,
+        nsa_window_size=args.nsa_window_size,
+        nsa_cmp_mlp_ratio=args.nsa_cmp_mlp_ratio,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

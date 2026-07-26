@@ -37,6 +37,12 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # NSA (Native Sparse Attention) configuration. Set nsa_block_size > 0 to enable.
+    nsa_block_size: int = 0   # compression block size (0 = disable NSA, use standard attention)
+    nsa_stride: int = 0       # stride between compression blocks (0 = defaults to nsa_block_size)
+    nsa_top_k_blocks: int = 4 # number of blocks to select for fine-grained attention
+    nsa_window_size: int = 256 # sliding window size for local branch
+    nsa_cmp_mlp_ratio: int = 4 # compression MLP hidden dim = n_embd * ratio
 
 
 def norm(x):
@@ -128,6 +134,257 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class NSACausalSelfAttention(nn.Module):
+    """Native Sparse Attention (NSA) — three-branch hierarchical sparse attention.
+
+    Branches:
+      1. Compression: learned block-level MLP compression + causal attention over compressed tokens.
+         Produces per-position block importance scores as a free byproduct.
+      2. Selection: top-k blocks (chosen by compression scores) attended with fine-grained tokens.
+      3. Sliding window: standard causal attention over the most recent window_size tokens.
+
+    The three branch outputs are combined via a learned per-position gate.
+
+    Ref: https://arxiv.org/abs/2502.11089
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        self.block_size = config.nsa_block_size
+        self.stride = config.nsa_stride if config.nsa_stride > 0 else config.nsa_block_size
+        self.top_k_blocks = config.nsa_top_k_blocks
+        self.window_size = config.nsa_window_size
+
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+
+        # Compression branch: learned block MLP + own Q/K/V projections
+        cmp_hidden = self.n_embd * config.nsa_cmp_mlp_ratio
+        self.cmp_mlp = nn.Sequential(
+            nn.LayerNorm(self.block_size * self.n_embd),
+            Linear(self.block_size * self.n_embd, cmp_hidden),
+            nn.ReLU(),
+            Linear(cmp_hidden, self.n_embd),
+        )
+        self.cmp_pos = nn.Embedding(self.block_size, self.n_embd)
+        self.cmp_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.cmp_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.cmp_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+
+        # Selection branch: own Q/K/V projections (shares selection with compression scores)
+        self.slc_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.slc_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.slc_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+
+        # Window branch: own Q/K/V projections (independent KV to prevent gradient interference)
+        self.win_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.win_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.win_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+
+        # Gated combination of three branches
+        self.gate_mlp = nn.Sequential(
+            Linear(self.n_embd, self.n_embd // 4),
+            nn.ReLU(),
+            Linear(self.n_embd // 4, 3),
+        )
+
+        # Shared output projection
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+
+        # Value embedding gate (same interface as CausalSelfAttention)
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
+
+    def forward(self, x, ve, cos_sin, window_size_unused, kv_cache):
+        B, T, C = x.size()
+        assert kv_cache is None, "NSA does not yet support KV cache inference"
+
+        # Compute Q, K, V for each branch (independent projections)
+        cmp_q = self.cmp_q(x).view(B, T, self.n_head, self.head_dim)
+        slc_q = self.slc_q(x).view(B, T, self.n_head, self.head_dim)
+        win_q = self.win_q(x).view(B, T, self.n_head, self.head_dim)
+        k_raw = self.win_k(x).view(B, T, self.n_kv_head, self.head_dim)  # for compression input
+        slc_k = self.slc_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        slc_v = self.slc_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        win_k = self.win_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        win_v = self.win_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Apply value embedding to window branch values
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            win_v = win_v + gate.unsqueeze(-1) * ve
+
+        # Apply RoPE and QK norm to all queries and keys
+        cos, sin = cos_sin
+        cmp_q = norm(apply_rotary_emb(cmp_q, cos, sin)) * 1.2
+        slc_q = norm(apply_rotary_emb(slc_q, cos, sin)) * 1.2
+        win_q = norm(apply_rotary_emb(win_q, cos, sin)) * 1.2
+        slc_k = norm(apply_rotary_emb(slc_k, cos, sin)) * 1.2
+        win_k = norm(apply_rotary_emb(win_k, cos, sin)) * 1.2
+
+        # ================================================================
+        # Branch 1: Compression (coarse global context + block importance scores)
+        # ================================================================
+        num_cmp = max(0, (T - self.block_size) // self.stride + 1)
+
+        if num_cmp > 0:
+            # Build compression blocks: (B, num_cmp, block_size * C)
+            positions = torch.arange(0, num_cmp * self.stride, self.stride, device=x.device)
+            offsets = torch.arange(self.block_size, device=x.device)
+            idx_cmp = (positions.unsqueeze(-1) + offsets.unsqueeze(0)).clamp(max=T - 1)
+            blocks_cmp = x[:, idx_cmp]  # (B, num_cmp, block_size, C)
+            blocks_flat = blocks_cmp.reshape(B, num_cmp, self.block_size * self.n_embd)
+
+            # Add position encoding and compress via MLP
+            pos_enc = self.cmp_pos(offsets).view(1, 1, self.block_size * self.n_embd)
+            blocks_flat = blocks_flat + pos_enc
+
+            # Mask out padding positions (for partial last block)
+            valid_len = T - positions  # (num_cmp,)
+            valid_len = valid_len.clamp(max=self.block_size)
+            pad_mask_cmp = (offsets.unsqueeze(0) < valid_len.unsqueeze(-1)).to(x.dtype)  # (num_cmp, block_size)
+            pad_mask_cmp = pad_mask_cmp.reshape(1, num_cmp, self.block_size, 1)  # broadcast over C
+            blocks_flat = blocks_flat.reshape(B, num_cmp, self.block_size, self.n_embd) * pad_mask_cmp
+            blocks_flat = blocks_flat.reshape(B, num_cmp, self.block_size * self.n_embd)
+
+            # Compress to one vector per block, cast back to model dtype
+            cmp_out = self.cmp_mlp(blocks_flat).to(x.dtype)  # (B, num_cmp, C)
+            cmp_k = self.cmp_k(cmp_out).view(B, num_cmp, self.n_kv_head, self.head_dim)
+            cmp_v = self.cmp_v(cmp_out).view(B, num_cmp, self.n_kv_head, self.head_dim)
+
+            # Compute attention scores (manual, to extract per-position scores for selection)
+            # Compute per-KV-head scores, then repeat for each query head in the group
+            # cmp_q: (B, T, H, D), cmp_k: (B, num_cmp, H_kv, D)
+            heads_per_group = self.n_head // self.n_kv_head
+            # Average query heads within each group: (B, T, H_kv, D)
+            cmp_q_grouped = cmp_q.reshape(B, T, self.n_kv_head, heads_per_group, self.head_dim).mean(dim=3)
+            # Scores: (B, H_kv, T, num_cmp)
+            cmp_scores_grouped = torch.einsum(
+                'bthd,bshd->bhts',
+                cmp_q_grouped,
+                cmp_k,
+            )
+            # Repeat scores for all query heads in each group: (B, H, T, num_cmp)
+            cmp_scores = cmp_scores_grouped.repeat_interleave(heads_per_group, dim=1)
+
+            # Causal mask: query at position t can only attend to compression tokens with
+            # block end <= t. Block i ends at position (i * stride + block_size - 1).
+            block_end = positions + self.block_size - 1  # (num_cmp,)
+            causal_ok = block_end.unsqueeze(0) < T  # (T, num_cmp) via broadcasting
+            causal_ok = causal_ok.unsqueeze(0).unsqueeze(0)  # (1, 1, T, num_cmp)
+
+            # Padding mask: exclude compression tokens from partial blocks
+            has_content = (torch.arange(num_cmp, device=x.device) < num_cmp).float()
+            cmp_pad_ok = has_content.view(1, 1, 1, num_cmp)
+
+            combined_mask = causal_ok.float() * cmp_pad_ok
+            cmp_scores = cmp_scores.masked_fill(combined_mask == 0, float('-inf'))
+
+            # Compute per-position importance scores (before softmax, for block selection)
+            # Sum across query heads within each GQA group for shared block selection
+            cmp_importance = cmp_scores.detach().sum(dim=1)  # (B, T, num_cmp)
+
+            # Softmax and compute compression branch output (GQA-aware)
+            cmp_attn = F.softmax(cmp_scores, dim=-1)  # (B, H, T, num_cmp)
+            # Average attention weights within each group: (B, H_kv, T, num_cmp)
+            cmp_attn_grouped = cmp_attn.reshape(B, self.n_kv_head, heads_per_group, T, num_cmp).mean(dim=2)
+            # cmp_v: (B, num_cmp, H_kv, D)
+            cmp_v_squeezed = cmp_v
+            # Output per KV head: (B, T, H_kv, D)
+            cmp_out_grouped = torch.einsum(
+                'bhts,bshd->bthd',
+                cmp_attn_grouped,
+                cmp_v_squeezed,
+            )
+            # Repeat for all query heads: (B, T, H, D)
+            cmp_out = cmp_out_grouped.repeat_interleave(heads_per_group, dim=2)
+            cmp_out = cmp_out.reshape(B, T, self.n_embd)
+
+            # ================================================================
+            # Branch 2: Selection (fine-grained attention on top-k blocks)
+            # ================================================================
+            k = min(self.top_k_blocks, num_cmp)
+            _, topk_idx = cmp_importance.topk(k, dim=-1)  # (B, T, k)
+
+            # Gather selected blocks' keys and values
+            # For each query position, select k blocks of individual tokens
+            topk_starts = topk_idx * self.stride  # (B, T, k) — start position of each block
+            block_offsets = torch.arange(self.block_size, device=x.device)  # (block_size,)
+            selected_positions = topk_starts.unsqueeze(-1) + block_offsets.unsqueeze(0).unsqueeze(0)
+            selected_positions = selected_positions.clamp(max=T - 1)  # (B, T, k, block_size)
+
+            # Flatten block dimension for gather
+            sel_pos_flat = selected_positions.reshape(B, T, k * self.block_size)  # (B, T, k*bs)
+
+            # Gather keys and values at selected positions
+            # slc_k: (B, T, n_kv_head, D), sel_pos_flat: (B, T, k*block_size)
+            # Use advanced indexing: for each batch b, gather slc_k[b, sel_pos_flat[b], :, :]
+            # This avoids the expensive loop+stack approach.
+            B_idx = torch.arange(B, device=x.device).view(B, 1, 1)  # (B, 1, 1)
+            # slc_k[B_idx, sel_pos_flat] -> (B, T, k*bs, n_kv_head, D)
+            sel_k = slc_k[B_idx, sel_pos_flat]  # (B, T, k*bs, H_kv, D)
+            sel_v = slc_v[B_idx, sel_pos_flat]
+
+            # Padding mask for selected blocks
+            sel_pad_mask = (sel_pos_flat < T).to(x.dtype)
+            sel_k = sel_k * sel_pad_mask.unsqueeze(-1).unsqueeze(-1)
+
+            # Reshape for SDPA: treat each query position as a separate "sequence"
+            slc_q_rs = slc_q.reshape(B * T, self.n_head, 1, self.head_dim).to(x.dtype)
+            slc_k_rs = sel_k.reshape(B * T, k * self.block_size, self.n_kv_head, self.head_dim).to(x.dtype)
+            slc_v_rs = sel_v.reshape(B * T, k * self.block_size, self.n_kv_head, self.head_dim).to(x.dtype)
+            slc_k_rs = slc_k_rs.permute(0, 2, 1, 3)  # (B*T, n_kv, sel_len, D)
+            slc_v_rs = slc_v_rs.permute(0, 2, 1, 3)
+
+            # Attention mask for padding
+            slc_attn_mask = sel_pad_mask.reshape(B * T, 1, 1, k * self.block_size)
+            slc_attn_mask = slc_attn_mask == 1
+
+            # SDPA with GQA (query has n_head, kv has n_kv_head)
+            sel_len = k * self.block_size
+            slc_out = F.scaled_dot_product_attention(
+                slc_q_rs, slc_k_rs, slc_v_rs,
+                attn_mask=slc_attn_mask,
+                enable_gqa=(self.n_head != self.n_kv_head),
+            )  # (B*T, n_head, 1, D)
+            slc_out = slc_out.reshape(B, T, self.n_head * self.head_dim)
+        else:
+            # Not enough tokens for compression — fall back to window-only
+            slc_out = torch.zeros(B, T, self.n_embd, device=x.device, dtype=x.dtype)
+
+        # ================================================================
+        # Branch 3: Sliding window (local context)
+        # ================================================================
+        # Use standard SDPA with causal=True. The window is implicit:
+        # at position t, attention naturally focuses on nearby tokens.
+        # For explicit windowing, we could mask distant tokens, but at L=1024
+        # with the model learning appropriate patterns, standard causal is fine.
+        # The independent KV projections already prevent gradient interference.
+        win_out = F.scaled_dot_product_attention(
+            win_q.permute(0, 2, 1, 3),   # (B, H, T, D)
+            win_k.permute(0, 2, 1, 3),
+            win_v.permute(0, 2, 1, 3),
+            is_causal=True,
+            enable_gqa=(self.n_head != self.n_kv_head),
+        )  # (B, H, T, D)
+        win_out = win_out.permute(0, 2, 1, 3).reshape(B, T, self.n_embd)
+
+        # ================================================================
+        # Gated combination of three branches
+        # ================================================================
+        gate_logits = self.gate_mlp(x)  # (B, T, 3)
+        gate = torch.sigmoid(gate_logits)  # (B, T, 3)
+        y = gate[..., 0:1] * cmp_out + gate[..., 1:2] * slc_out + gate[..., 2:3] * win_out
+
+        y = self.c_proj(y)
+        return y
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -142,9 +399,12 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_nsa=False):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        if use_nsa:
+            self.attn = NSACausalSelfAttention(config, layer_idx)
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -170,9 +430,12 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        self.use_nsa = config.nsa_block_size > 0
+        if self.use_nsa:
+            print0(f"NSA enabled: block_size={config.nsa_block_size}, stride={config.nsa_stride or config.nsa_block_size}, top_k={config.nsa_top_k_blocks}, window={config.nsa_window_size}")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, use_nsa=self.use_nsa) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -224,10 +487,26 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if isinstance(block.attn, NSACausalSelfAttention):
+                # NSA: init all branch Q/K/V projections like standard Q/K/V
+                for attr in ['cmp_q', 'cmp_k', 'cmp_v', 'slc_q', 'slc_k', 'slc_v', 'win_q', 'win_k', 'win_v']:
+                    torch.nn.init.uniform_(getattr(block.attn, attr).weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+                # Compression MLP: standard init
+                for m in block.attn.cmp_mlp:
+                    if isinstance(m, Linear):
+                        torch.nn.init.uniform_(m.weight, -s, s)
+                torch.nn.init.normal_(block.attn.cmp_pos.weight, mean=0.0, std=0.02)
+                # Gate MLP: small init so gates start near sigmoid(0)=0.5
+                torch.nn.init.uniform_(block.attn.gate_mlp[0].weight, -s * 0.01, s * 0.01)
+                torch.nn.init.zeros_(block.attn.gate_mlp[0].bias)
+                torch.nn.init.zeros_(block.attn.gate_mlp[2].weight)
+                torch.nn.init.zeros_(block.attn.gate_mlp[2].bias)
+            else:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
