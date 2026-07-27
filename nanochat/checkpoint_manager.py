@@ -25,6 +25,18 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Mamba-2 SSM parameters (default to reasonable values for old checkpoints)
+    mamba_defaults = {
+        "mamba_d_state": 128,
+        "mamba_headdim": 64,
+        "mamba_expand": 2,
+        "mamba_ngroups": 1,
+        "mamba_chunk_size": 256,
+    }
+    for key, default in mamba_defaults.items():
+        if key not in model_config_kwargs:
+            model_config_kwargs[key] = default
+            log0(f"Patching missing {key} in model config to {default}")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

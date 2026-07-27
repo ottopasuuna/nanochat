@@ -34,9 +34,16 @@ class GPTConfig:
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
-    # Characters: L=long (full context), S=short (quarter context)
+    # Characters: L=long (full context), S=short (quarter context), M=mamba (SSM layer)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
+    #          "MMML"=hybrid: three mamba layers then one attention layer
     window_pattern: str = "SSSL"
+    # Mamba-2 SSM parameters (only used for "M" layers in window_pattern)
+    mamba_d_state: int = 128     # SSM state dimension (N)
+    mamba_headdim: int = 64     # SSM head dimension (P)
+    mamba_expand: int = 2       # expansion factor for d_inner
+    mamba_ngroups: int = 1      # number of groups for B/C (grouped SSM)
+    mamba_chunk_size: int = 256 # chunk size for chunked SSD algorithm
 
 
 def norm(x):
@@ -50,8 +57,11 @@ class Linear(nn.Linear):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+def has_ve(layer_idx, n_layer, layer_type='L'):
+    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included).
+    Mamba layers (layer_type='M') never have value embeddings."""
+    if layer_type == 'M':
+        return False
     return layer_idx % 2 == (n_layer - 1) % 2
 
 def apply_rotary_emb(x, cos, sin):
@@ -142,13 +152,31 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, layer_type='L'):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.layer_type = layer_type
+        if layer_type == 'M':
+            from nanochat.mamba import Mamba2Mixer
+            self.mamba = Mamba2Mixer(
+                d_model=config.n_embd,
+                d_state=config.mamba_d_state,
+                headdim=config.mamba_headdim,
+                expand=config.mamba_expand,
+                ngroups=config.mamba_ngroups,
+                chunk_size=config.mamba_chunk_size,
+                layer_idx=layer_idx,
+            )
+            self.attn = None
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
+            self.mamba = None
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if self.mamba is not None:
+            x = x + self.mamba(norm(x), kv_cache)
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -162,9 +190,10 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
-        # Compute per-layer window sizes for sliding window attention
+        # Compute per-layer window sizes and layer types
+        # layer_types is a list of chars in {'L', 'S', 'M'} for each layer
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
-        self.window_sizes = self._compute_window_sizes(config)
+        self.layer_types, self.window_sizes = self._compute_window_sizes(config)
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -172,7 +201,7 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, self.layer_types[layer_idx]) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -189,7 +218,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer, self.layer_types[i])})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -224,10 +253,16 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.layer_type == 'M':
+                # Mamba layer: initialize with mamba-specific init
+                block.mamba.init_weights()
+            else:
+                # Attention layer: standard init
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            # MLP is always present
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -251,7 +286,7 @@ class GPT(nn.Module):
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if block.attn is not None and block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
@@ -286,32 +321,36 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         """
-        Compute per-layer window sizes for sliding window attention.
+        Compute per-layer window sizes and layer types.
 
-        Returns list of (left, right) tuples for FA3's window_size parameter:
-        - left: how many tokens before current position to attend to (-1 = unlimited)
-        - right: how many tokens after current position to attend to (0 for causal)
+        Returns:
+            layer_types: list of chars ('L', 'S', 'M') for each layer
+            window_sizes: list of (left, right) tuples for attention layers (None for Mamba layers)
 
         Pattern string is tiled across layers. Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
+        Characters: L=long (full context), S=short (quarter context), M=mamba (SSM layer)
         """
         pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
+        assert all(c in "SLM" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S, L, and M."
         # Map characters to window sizes
         long_window = config.sequence_len
         short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
+            "M": None,  # Mamba layers don't use attention window
         }
         # Tile pattern across layers
+        layer_types = []
         window_sizes = []
         for layer_idx in range(config.n_layer):
             char = pattern[layer_idx % len(pattern)]
+            layer_types.append(char)
             window_sizes.append(char_to_window[char])
-        # Final layer always gets full context
+        # Final layer always gets full context attention
+        layer_types[-1] = 'L'
         window_sizes[-1] = (long_window, 0)
-        return window_sizes
+        return layer_types, window_sizes
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -323,19 +362,34 @@ class GPT(nn.Module):
         Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
         On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
         With sliding windows, effective_seq_len varies per layer (capped by window size).
-        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
-        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
-        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
-        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+        Ref: https://arxiv.org.org/abs/2204.02311 (PaLM paper).
+        For Mamba layers, the chunked SSD scan cost is independent of total sequence length
+        (per token): dominated by the intra-chunk matmuls (which scale with chunk_size, like a
+        short attention window) plus the chunk-state read/write matmuls.
         """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        # Sum attention/SSM FLOPs per layer
+        extra_flops = 0
+        for layer_type, window_size in zip(self.layer_types, self.window_sizes):
+            if layer_type == 'M':
+                # Mamba-2 chunked SSD scan FLOPs per token (fwd+bwd, 6x MACs convention).
+                # Per-token MACs: intra-chunk C@B^T (c*N) and (C@B^T)@X (c*H*P),
+                # chunk-state write + read (2*H*P*N), inter-chunk scan (H*P*N/c), skip D*x (H*P),
+                # plus the short causal conv (kernel 4 over the conv channels).
+                d_inner = self.config.mamba_expand * self.config.n_embd
+                H = d_inner // self.config.mamba_headdim      # mamba heads
+                P = self.config.mamba_headdim                 # mamba head dim
+                N = self.config.mamba_d_state                 # SSM state size
+                c = self.config.mamba_chunk_size
+                scan_macs = c*H*P + c*N + 2*H*P*N + H*P*N//c + H*P
+                conv_macs = 4 * (d_inner + 2*self.config.mamba_ngroups*N)
+                extra_flops += 6 * (scan_macs + conv_macs)
+            else:
+                # Attention layer
+                window = window_size[0]  # (left, right) tuple, we use left
+                effective_seq = t if window < 0 else min(window, t)
+                extra_flops += 12 * h * q * effective_seq
+        num_flops_per_token = 6 * self.num_matmul_params() + extra_flops
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -352,10 +406,15 @@ class GPT(nn.Module):
         """
         Forward FLOPs to decode one token at a given context length during inference:
         2 FLOPs per matmul param, plus attention over min(context, window) per layer.
+        Mamba layers: step() cost ~ 2 * matmul_params + O(nheads * d_state).
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
+        attn_flops = 0
+        for layer_type, window_size in zip(self.layer_types, self.window_sizes):
+            if layer_type != 'M':
+                window = window_size[0]
+                attn_flops += 4 * h * q * min(context_len, window)
         decode_flops = 2 * self.num_matmul_params() + attn_flops
         return decode_flops
 
@@ -364,27 +423,42 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = 0
-        for window, _ in self.window_sizes:
-            w = min(window, num_tokens)
-            attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
-            attn_flops += 4 * h * q * attended_tokens
+        for layer_type, window_size in zip(self.layer_types, self.window_sizes):
+            if layer_type != 'M':
+                window = window_size[0]
+                w = min(window, num_tokens)
+                attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
+                attn_flops += 4 * h * q * attended_tokens
         prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
-        """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
+        """Bytes to *store* one token of KV cache during inference, per row (attention layers only).
+        Mamba layers have fixed-size states that don't grow with sequence length."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        num_attn_layers = sum(1 for lt in self.layer_types if lt != 'M')
+        return num_attn_layers * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
         """Bytes of KV cache *read* by one decode step at a given context length, per row.
-        Sliding window layers only attend to (and read) the last `window` tokens."""
+        Sliding window layers only attend to (and read) the last `window` tokens.
+        Mamba layers have fixed-size states (not counted here)."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
-        for window, _ in self.window_sizes:
-            total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
+        for layer_type, window_size in zip(self.layer_types, self.window_sizes):
+            if layer_type != 'M':
+                window = window_size[0]
+                total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
+        return total
+
+    def mamba_state_bytes(self):
+        """Bytes for fixed-size Mamba SSM + conv states per row (all M layers combined)."""
+        total = 0
+        for block in self.transformer.h:
+            if hasattr(block, 'mamba') and block.mamba is not None:
+                total += block.mamba.mamba_state_bytes()
         return total
 
     def num_scaling_params(self):
@@ -420,14 +494,27 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Mamba non-2D params can't use Muon (requires 2-D)
+        # Split by rank: 1D (A_log, dt_bias, D, norm_weight) and conv (3D conv1d.weight)
+        mamba_1d_params = []
+        mamba_conv_params = []
+        matrix_params = []
+        for block in self.transformer.h:
+            for name, param in block.named_parameters():
+                if param.dim() < 2:
+                    mamba_1d_params.append(param)
+                elif param.dim() == 2:
+                    matrix_params.append(param)
+                else:
+                    mamba_conv_params.append(param)  # 3D conv weights
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        total_accounted = len(matrix_params) + len(mamba_1d_params) + len(mamba_conv_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == total_accounted, f"Parameter count mismatch: {len(list(self.parameters()))} != {total_accounted}"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -443,6 +530,14 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Mamba 1-D params (A_log, dt_bias, D, norm_weight) -> AdamW (Muon requires 2-D)
+        if mamba_1d_params:
+            param_groups.append(dict(kind='adamw', params=mamba_1d_params, lr=0.02, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0))
+            print0(f"Mamba 1-D params: {len(mamba_1d_params)} params routed to AdamW")
+        # Mamba conv params (3D conv1d.weight) -> AdamW (Muon requires exactly 2-D)
+        if mamba_conv_params:
+            param_groups.append(dict(kind='adamw', params=mamba_conv_params, lr=0.02, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0))
+            print0(f"Mamba conv params: {len(mamba_conv_params)} params routed to AdamW")
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

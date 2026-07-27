@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 import wandb
 import torch
+torch._dynamo.config.cache_size_limit = 32  # Mamba hybrid needs more shape compilations
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
@@ -52,7 +53,7 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default="SSSL", help="layer pattern tiled across layers: L=full context, S=short window, M=mamba SSM (e.g. 'MMML')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -112,7 +113,7 @@ else:
     else:
         print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
+    if 'S' in args.window_pattern:
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)

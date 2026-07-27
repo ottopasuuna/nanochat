@@ -87,34 +87,56 @@ class KVCache:
     - Tensors are (B, T, H, D) not (B, H, T, D)
     - FA3 updates the cache in-place during flash_attn_with_kvcache
     - Position tracked per batch element via cache_seqlens tensor
+    - Supports hybrid models: attention layers get KV cache, Mamba layers get conv/SSM states
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype, layer_types=None):
         self.batch_size = batch_size
         self.max_seq_len = seq_len
         self.n_layers = num_layers
         self.n_heads = num_heads
         self.head_dim = head_dim
-        # Pre-allocate cache tensors: (n_layers, B, T, H, D)
-        self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-        self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+        self.layer_types = layer_types or ['L'] * num_layers
+
+        # Build mapping: layer_idx -> attention cache slot (only for non-M layers)
+        self.attn_layer_map = {}  # layer_idx -> cache_slot_idx
+        attn_count = 0
+        for i, lt in enumerate(self.layer_types):
+            if lt != 'M':
+                self.attn_layer_map[i] = attn_count
+                attn_count += 1
+        self.n_attn_layers = attn_count
+
+        # Pre-allocate KV cache for attention layers only
+        if self.n_attn_layers > 0:
+            self.k_cache = torch.zeros(self.n_attn_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+            self.v_cache = torch.zeros(self.n_attn_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+        else:
+            self.k_cache = None
+            self.v_cache = None
+
         # Current sequence length per batch element (FA3 needs int32)
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         # Previous token's normalized embedding for smear (set by model forward pass)
         self.prev_embedding = None
 
+        # Mamba states: dict of layer_idx -> (conv_state, ssm_state)
+        self.mamba_states = {}  # populated lazily by Mamba2Mixer
+
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
+        self.mamba_states.clear()
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
         return self.cache_seqlens[0].item()
 
     def get_layer_cache(self, layer_idx):
-        """Return (k_cache, v_cache) views for a specific layer."""
-        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+        """Return (k_cache, v_cache) views for a specific attention layer."""
+        slot = self.attn_layer_map[layer_idx]
+        return self.k_cache[slot], self.v_cache[slot]
 
     def advance(self, num_tokens):
         """Advance the cache position by num_tokens."""
@@ -129,12 +151,20 @@ class KVCache:
         assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
         assert self.max_seq_len >= other.max_seq_len
         other_pos = other.get_pos()
-        self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
-        self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
+        # Copy attention caches
+        if self.n_attn_layers > 0 and other.n_attn_layers > 0:
+            self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
+            self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
         # Copy smear state: expand batch=1 prev_embedding to num_samples
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+        # Copy mamba states
+        for layer_idx, (conv_state, ssm_state) in other.mamba_states.items():
+            self.mamba_states[layer_idx] = (
+                conv_state.expand(self.batch_size, -1, -1).clone(),
+                ssm_state.expand(self.batch_size, -1, -1, -1).clone(),
+            )
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
@@ -193,7 +223,12 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = {
+            "num_heads": m.n_kv_head,
+            "head_dim": m.n_embd // m.n_head,
+            "num_layers": m.n_layer,
+            "layer_types": getattr(self.model, 'layer_types', None),
+        }
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
