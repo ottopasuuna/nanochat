@@ -122,6 +122,10 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
+        # XSA (Exclusive Self Attention): remove the component of the output along the token's own value vector
+        v_exp = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2) if self.n_head != self.n_kv_head else v
+        y = y - (y * v_exp).sum(-1, keepdim=True) * v_exp / (v_exp * v_exp).sum(-1, keepdim=True)
+
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
