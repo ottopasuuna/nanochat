@@ -76,10 +76,17 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Token Superposition Training (TST)
+parser.add_argument("--tst-bag-size", type=int, default=1, help="TST superposition bag size s; 1 = disabled")
+parser.add_argument("--tst-ratio", type=float, default=0.3, help="fraction of training steps in the TST superposition phase")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+# TST argument validation
+if args.tst_bag_size > 1:
+    assert args.max_seq_len % args.tst_bag_size == 0, f"max_seq_len ({args.max_seq_len}) must be divisible by tst_bag_size ({args.tst_bag_size})"
+    assert 0 < args.tst_ratio <= 1.0, f"tst_ratio must be in (0, 1], got {args.tst_ratio}"
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -414,6 +421,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+tst_bag_size = args.tst_bag_size # initial TST bag size (updated at end of each step)
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -509,7 +517,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, tst_bag_size=tst_bag_size)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -577,12 +585,18 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/tst_phase": 1 if tst_bag_size > 1 else 0,
         }
         wandb_run.log(log_data)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
+
+    # TST phase management: compute bag size for the NEXT iteration's eval/sampling/checkpoint
+    tst_bag_size = args.tst_bag_size if (args.tst_bag_size > 1 and step < round(args.tst_ratio * num_iterations)) else 1
+    if master_process and args.tst_bag_size > 1 and step == round(args.tst_ratio * num_iterations):
+        print0(f"Step {step:05d} | TST superposition phase ended, entering recovery phase")
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.

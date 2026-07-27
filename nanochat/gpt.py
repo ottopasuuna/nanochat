@@ -456,8 +456,20 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', tst_bag_size=1):
         B, T = idx.size()
+
+        # Token Superposition Training (TST): fold (B, T) into (B, T//s, s) bags
+        idx_raw = idx  # save raw idx for bag target construction
+        if tst_bag_size > 1:
+            assert kv_cache is None, "TST is training-only (kv_cache must be None)"
+            assert targets is not None, "TST requires targets to be provided"
+            s = tst_bag_size
+            assert T % s == 0, f"Sequence length {T} must be divisible by bag size {s}"
+            bags = idx.view(B, T // s, s)  # (B, n, s) where n = T // s
+            tst_idx = bags  # for VE lookups
+            idx = bags      # for wte lookup (will be mean-pooled)
+            T = T // s      # redefine T to folded length
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -468,8 +480,11 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        x = self.transformer.wte(idx) # (B, T, D) or (B, n, s, D) in TST mode
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        if tst_bag_size > 1:
+            # TST: mean-pool embeddings over the bag dimension (sum in fp32, divide by s)
+            x = x.float().mean(dim=2).to(COMPUTE_DTYPE)  # (B, n, s, D) -> (B, n, D)
         x = norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
@@ -498,7 +513,9 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = self.value_embeds[str(i)](tst_idx if tst_bag_size > 1 else idx).to(x.dtype) if str(i) in self.value_embeds else None
+            if tst_bag_size > 1 and ve is not None:
+                ve = ve.float().mean(dim=2).to(x.dtype)  # (B, n, s, D) -> (B, n, D)
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
@@ -517,7 +534,19 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if tst_bag_size > 1:
+                # TST: MCE loss — average CE over each token in the target bag
+                # bag_targets[:, i, :] = raw tokens at position i+1 (the "next bag")
+                n = T  # folded sequence length
+                bag_targets = torch.full((B, n, tst_bag_size), -1, dtype=torch.long, device=idx_raw.device)
+                bag_targets[:, :-1, :] = idx_raw.view(B, n, tst_bag_size)[:, 1:, :]
+                loss = torch.stack([
+                    F.cross_entropy(logits.view(-1, logits.size(-1)), bag_targets[:, :, j].reshape(-1),
+                                    ignore_index=-1, reduction=loss_reduction)
+                    for j in range(tst_bag_size)
+                ]).mean()
+            else:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly
