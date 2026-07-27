@@ -265,6 +265,8 @@ def get_peak_flops(device_name: str) -> float:
         (["5090"], 209.5e12),
         (["4090"], 165.2e12),
         (["3090"], 71e12),
+        (["3060 ti"], 41.0e12),
+        (["3060"], 25.4e12),
     )
     for patterns, flops in _PEAK_FLOPS_TABLE:
         if all(p in name for p in patterns):
@@ -318,6 +320,8 @@ def get_peak_bandwidth(device_name: str) -> float:
         (["5090"], 1.79e12),
         (["4090"], 1.01e12),
         (["3090"], 936e9),
+        (["3060 ti"], 448e9),
+        (["3060"], 360e9),
     )
     for patterns, bandwidth in _PEAK_BANDWIDTH_TABLE:
         if all(p in name for p in patterns):
