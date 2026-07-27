@@ -99,8 +99,8 @@ torchrun --standalone --nnodes 1 --nproc_per_node=1 -m scripts.base_train -- \
 # python -m scripts.base_eval --model-tag $MODEL_TAG --device-batch-size=16 --max-per-task=100 --split-tokens=524288
 python -m scripts.base_eval \
     --eval bpb,sample \
-    --split-tokens 2048 \
-    --device-batch-size=1 \
+    --split-tokens $((256*1024)) \
+    --device-batch-size=8 \
     --model-tag $MODEL_TAG \
     --device-type cuda
 
